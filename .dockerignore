@@ -1,0 +1,11 @@
+node_modules
+dist
+.maxential
+.git
+.npmrc
+*.md
+docs
+tests
+.claude
+.vscode
+*.code-workspace
