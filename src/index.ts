@@ -15,7 +15,7 @@ import { SequentialThinkingServer } from "./lib.js";
 
 const THINK_TOOL: Tool = {
   name: "think",
-  description: "Add a thought to your reasoning chain. Use this for step-by-step problem solving. The server automatically tracks thought numbers and history.",
+  description: "Add a numbered thought to your reasoning chain. Each call persists to SQLite automatically. On first call, a new session is created. Use for any multi-step reasoning — analysis, debugging, design, research. Subsequent thoughts are appended to the active branch (main by default). Do not use for simple, single-step answers.",
   inputSchema: {
     type: "object",
     properties: {
@@ -30,7 +30,7 @@ const THINK_TOOL: Tool = {
 
 const REVISE_TOOL: Tool = {
   name: "revise",
-  description: "Revise a previous thought. Use when you realize earlier thinking was flawed or incomplete.",
+  description: "Replace a previous thought with updated reasoning. The original thought is preserved in revision history. Use when earlier thinking was wrong, incomplete, or superseded by new information. Persists to SQLite. Do not use to add new thoughts — use think instead.",
   inputSchema: {
     type: "object",
     properties: {
@@ -43,7 +43,7 @@ const REVISE_TOOL: Tool = {
 
 const COMPLETE_TOOL: Tool = {
   name: "complete",
-  description: "Mark your thinking chain as complete with a final conclusion.",
+  description: "Mark the thinking chain as complete with a final conclusion. Sets the session status to 'complete'. Use when reasoning has reached a definitive answer. The session remains accessible via session_load and session_list. Do not call if you plan to continue thinking — you can always add more thoughts.",
   inputSchema: {
     type: "object",
     properties: {
@@ -56,7 +56,7 @@ const COMPLETE_TOOL: Tool = {
 
 const RESET_TOOL: Tool = {
   name: "reset",
-  description: "Clear the current thinking session and start fresh. Use when beginning a new problem.",
+  description: "Clear the in-memory thinking state and start a new session. The previous session's data remains in SQLite and can be loaded later with session_load. Destructive to current in-memory state only. Use when switching to an unrelated problem. Requires confirm=true to prevent accidental clearing.",
   inputSchema: {
     type: "object",
     properties: {
@@ -72,7 +72,7 @@ const RESET_TOOL: Tool = {
 
 const BRANCH_TOOL: Tool = {
   name: "branch",
-  description: "Create a new reasoning branch to explore an alternative path. Like git branches for thoughts.",
+  description: "Create a new reasoning branch and switch to it. Subsequent think calls go to this branch until you switch_branch. Use to explore an alternative approach without affecting the main thread. Each branch maintains its own thought sequence. Persists to SQLite. Use close_branch when a path is exhausted, or merge_branch to bring insights back to main.",
   inputSchema: {
     type: "object",
     properties: {
@@ -85,7 +85,7 @@ const BRANCH_TOOL: Tool = {
 
 const SWITCH_BRANCH_TOOL: Tool = {
   name: "switch_branch",
-  description: "Switch your active context to a different branch (or back to main).",
+  description: "Switch which branch receives new thoughts. Omit branchId to return to main. After switching, all think and revise calls apply to the active branch. Read-only tools (get_thought, search, get_history) can access any branch regardless of which is active. Does not modify any data.",
   inputSchema: {
     type: "object",
     properties: {
@@ -115,7 +115,7 @@ const GET_BRANCH_TOOL: Tool = {
 
 const CLOSE_BRANCH_TOOL: Tool = {
   name: "close_branch",
-  description: "Close a branch with an optional conclusion.",
+  description: "Close a branch, marking it as no longer active. Optionally include a conclusion summarizing what was learned. Closed branches and their thoughts are preserved and remain readable. Use when a line of reasoning is exhausted or the answer is clear. Cannot be reopened. To bring findings back to main first, use merge_branch instead.",
   inputSchema: {
     type: "object",
     properties: {
@@ -128,7 +128,7 @@ const CLOSE_BRANCH_TOOL: Tool = {
 
 const MERGE_BRANCH_TOOL: Tool = {
   name: "merge_branch",
-  description: "Merge insights from a branch back into main. Strategies: conclusion_only, full_integration, summary",
+  description: "Merge findings from a branch back into the main thread as a new thought on main. The branch is marked as merged afterward. Strategies: conclusion_only — adds only the branch conclusion to main; full_integration — adds all branch thoughts to main; summary — generates a condensed summary of the branch on main. Use after a branch has produced useful findings you want on the main thread.",
   inputSchema: {
     type: "object",
     properties: {
@@ -145,7 +145,7 @@ const MERGE_BRANCH_TOOL: Tool = {
 
 const GET_THOUGHT_TOOL: Tool = {
   name: "get_thought",
-  description: "Retrieve a specific thought by its number.",
+  description: "Retrieve a specific thought by its number, including any tags and revision history. Read-only. Use to reference or review earlier reasoning without scrolling through the full history.",
   inputSchema: {
     type: "object",
     properties: {
@@ -157,7 +157,7 @@ const GET_THOUGHT_TOOL: Tool = {
 
 const GET_HISTORY_TOOL: Tool = {
   name: "get_history",
-  description: "Get your thought history. Optionally filter by branch.",
+  description: "Retrieve the full thought history for the current session. Optionally filter to a specific branch or limit the number of results. Read-only. Returns thoughts in chronological order with their numbers, content, tags, and branch assignments.",
   inputSchema: {
     type: "object",
     properties: {
@@ -175,7 +175,7 @@ const GET_HISTORY_TOOL: Tool = {
 
 const TAG_TOOL: Tool = {
   name: "tag",
-  description: "Add or remove tags from a thought. Tags help categorize and search thoughts.",
+  description: "Add or remove semantic tags on a thought. Tags are searchable via the search tool. Common tags: hypothesis, evidence, decision, finding, question, risk. Persists to SQLite. At least one of 'add' or 'remove' should be provided.",
   inputSchema: {
     type: "object",
     properties: {
@@ -189,7 +189,7 @@ const TAG_TOOL: Tool = {
 
 const SEARCH_TOOL: Tool = {
   name: "search",
-  description: "Search through thought history by content or tags.",
+  description: "Search the current session's thoughts by text content, tags, or both. Text search is case-insensitive substring matching. Tag search requires all specified tags to be present. Optionally limit to a specific branch. Read-only. Returns matching thoughts with their numbers, content, and tags.",
   inputSchema: {
     type: "object",
     properties: {
@@ -203,7 +203,7 @@ const SEARCH_TOOL: Tool = {
 
 const EXPORT_TOOL: Tool = {
   name: "export",
-  description: "Export the thinking chain to markdown or JSON format.",
+  description: "Export the thinking chain as formatted text. Markdown format produces a human-readable document with headers and structure. JSON format produces machine-parseable output of all thoughts, branches, and tags. Optionally export a single branch. Read-only.",
   inputSchema: {
     type: "object",
     properties: {
@@ -216,7 +216,7 @@ const EXPORT_TOOL: Tool = {
 
 const VISUALIZE_TOOL: Tool = {
   name: "visualize",
-  description: "Generate a visual diagram of the thinking chain and branches.",
+  description: "Generate a diagram showing the thought chain structure and branch relationships. Mermaid format produces a graph suitable for rendering in GitHub, Obsidian, or documentation. ASCII format produces a plain-text diagram for terminal or inline display. Read-only.",
   inputSchema: {
     type: "object",
     properties: {
@@ -246,7 +246,7 @@ const SESSION_SAVE_TOOL: Tool = {
 
 const SESSION_LOAD_TOOL: Tool = {
   name: "session_load",
-  description: "Restore a previously saved thinking session into memory. Resumes where you left off — all thoughts, branches, and tags are restored.",
+  description: "Restore a previously saved thinking session into memory, replacing the current in-memory state. All thoughts, branches, and tags from the saved session are loaded. The current session's data is not lost — it remains in SQLite and can be loaded later. Use after session_list to find the session UUID. Replaces current working state.",
   inputSchema: {
     type: "object",
     properties: {
