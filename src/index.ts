@@ -56,7 +56,7 @@ const COMPLETE_TOOL: Tool = {
 
 const RESET_TOOL: Tool = {
   name: "reset",
-  description: "Clear the in-memory thinking state and start a new session. The previous session's data remains in SQLite and can be loaded later with session_load. Destructive to current in-memory state only. Use when switching to an unrelated problem. Requires confirm=true to prevent accidental clearing.",
+  description: "Clear the in-memory thinking state and start a fresh session. The previous session's data is NOT deleted — it remains in SQLite and can be loaded later with session_load. Destructive to in-memory state only. Returns confirmation. Use when switching to an unrelated problem where carrying the old context would be noise. Requires confirm=true to prevent accidental clearing.",
   inputSchema: {
     type: "object",
     properties: {
@@ -97,13 +97,13 @@ const SWITCH_BRANCH_TOOL: Tool = {
 
 const LIST_BRANCHES_TOOL: Tool = {
   name: "list_branches",
-  description: "List all reasoning branches with their status and thought counts.",
+  description: "List all reasoning branches in the current session. Read-only. Returns for each branch: branch ID, origin thought number, status (active/closed/merged), conclusion if set, thought count, and timestamps. Use to see what reasoning paths exist before switching, merging, or closing. The main branch is always included. No parameters — operates on the active session.",
   inputSchema: { type: "object", properties: {}, required: [] }
 };
 
 const GET_BRANCH_TOOL: Tool = {
   name: "get_branch",
-  description: "Retrieve complete details of a specific branch.",
+  description: "Retrieve a specific branch's metadata and full thought history. Read-only. Returns: branch ID, origin thought, status (active/closed/merged), conclusion if set, all thoughts in the branch with their numbers and content, and timestamps. Use to deeply inspect a branch's reasoning before deciding to merge, close, or continue it. Use list_branches first to get the branch ID.",
   inputSchema: {
     type: "object",
     properties: {
@@ -157,7 +157,7 @@ const GET_THOUGHT_TOOL: Tool = {
 
 const GET_HISTORY_TOOL: Tool = {
   name: "get_history",
-  description: "Retrieve the full thought history for the current session. Optionally filter to a specific branch or limit the number of results. Read-only. Returns thoughts in chronological order with their numbers, content, tags, and branch assignments.",
+  description: "Retrieve the thought history for the current active session. Read-only. Returns thoughts in chronological order with their numbers, content, tags, branch assignments, and any revision links. Optionally filter to a specific branch with branchId, or cap results with limit. Use to review the full reasoning chain or to find context before adding the next thought.",
   inputSchema: {
     type: "object",
     properties: {
@@ -203,7 +203,7 @@ const SEARCH_TOOL: Tool = {
 
 const EXPORT_TOOL: Tool = {
   name: "export",
-  description: "Export the thinking chain as formatted text. Markdown format produces a human-readable document with headers and structure. JSON format produces machine-parseable output of all thoughts, branches, and tags. Optionally export a single branch. Read-only.",
+  description: "Export the current session's thinking chain as formatted text. Read-only. Markdown format produces a human-readable document with section headers per thought, branch headings, and tags as inline markers — suitable for handoffs or documentation. JSON format produces machine-parseable output including all thoughts, branches, tags, and metadata. Optionally export a single branch by providing branchId. Default format is markdown. Use when sharing reasoning with humans or other systems.",
   inputSchema: {
     type: "object",
     properties: {
@@ -216,7 +216,7 @@ const EXPORT_TOOL: Tool = {
 
 const VISUALIZE_TOOL: Tool = {
   name: "visualize",
-  description: "Generate a diagram showing the thought chain structure and branch relationships. Mermaid format produces a graph suitable for rendering in GitHub, Obsidian, or documentation. ASCII format produces a plain-text diagram for terminal or inline display. Read-only.",
+  description: "Generate a visual diagram of the thinking chain showing thoughts, branches, branch points, and revisions. Read-only. Returns a single text block ready to display. Mermaid format produces a graph for rendering in GitHub, Obsidian, or markdown documentation. ASCII format produces a plain-text tree for terminal or inline display in conversation. Default format is mermaid. Use to share the reasoning structure or to orient in a long chain. Set showContent=true to include thought preview text in nodes (default false for compactness).",
   inputSchema: {
     type: "object",
     properties: {
@@ -233,7 +233,7 @@ const VISUALIZE_TOOL: Tool = {
 
 const SESSION_SAVE_TOOL: Tool = {
   name: "session_save",
-  description: "Name and describe the current thinking session for later retrieval. Data is already persisted automatically — this adds a meaningful name and optional description.",
+  description: "Name and describe the active thinking session for later retrieval. The session and all its thoughts are already persisted to SQLite automatically — this only adds a human-readable name and optional description. Persists session metadata. Use when you want to find this session later via session_list. Without session_save, the session keeps an auto-generated timestamp name.",
   inputSchema: {
     type: "object",
     properties: {
@@ -258,7 +258,7 @@ const SESSION_LOAD_TOOL: Tool = {
 
 const SESSION_LIST_TOOL: Tool = {
   name: "session_list",
-  description: "Browse available thinking sessions. Shows most recently updated first.",
+  description: "List previously saved thinking sessions in the SQLite database. Read-only. Returns: session UUID, name, description, status (active/complete/archived), created/updated timestamps, thought count, branch count. Sorted by most recently updated first. Use to find a session UUID before calling session_load or session_summary. Filter by status to find specifically complete or archived work.",
   inputSchema: {
     type: "object",
     properties: {
@@ -271,7 +271,7 @@ const SESSION_LIST_TOOL: Tool = {
 
 const SESSION_SUMMARY_TOOL: Tool = {
   name: "session_summary",
-  description: "Generate a compressed summary of a thinking session for token-efficient context loading. Includes key findings from conclusions, tagged thoughts, and branch results.",
+  description: "Generate a compressed text summary of a saved session for token-efficient context loading. Read-only. Returns: session metadata, key findings extracted from conclusions and tagged thoughts, branch results, and final conclusion. Use when you want context from a previous session without loading the full thought history. For full restoration use session_load instead. Default summary length is 2000 characters, adjustable via maxLength.",
   inputSchema: {
     type: "object",
     properties: {
