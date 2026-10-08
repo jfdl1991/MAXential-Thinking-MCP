@@ -1,4 +1,4 @@
-import Database from 'better-sqlite3';
+import initSqlJs, { Database as SqlJsDatabase, SqlValue } from 'sql.js';
 import { randomUUID } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -101,58 +101,62 @@ CREATE TABLE IF NOT EXISTS syntheses (
 `;
 
 // =============================================================================
-// Prepared Statement Types
-// =============================================================================
-
-interface PreparedStatements {
-  insertSession: Database.Statement;
-  updateSessionName: Database.Statement;
-  updateSessionTimestamp: Database.Statement;
-  updateSessionStatus: Database.Statement;
-  getSession: Database.Statement;
-  listSessions: Database.Statement;
-  listSessionsByStatus: Database.Statement;
-  countSessions: Database.Statement;
-  countSessionsByStatus: Database.Statement;
-  insertThought: Database.Statement;
-  getThoughtsBySession: Database.Statement;
-  getThoughtsByBranch: Database.Statement;
-  countThoughtsBySession: Database.Statement;
-  insertBranch: Database.Statement;
-  updateBranchStatus: Database.Statement;
-  updateBranchMerge: Database.Statement;
-  getBranchesBySession: Database.Statement;
-  countBranchesBySession: Database.Statement;
-  deleteTags: Database.Statement;
-  insertTag: Database.Statement;
-  getTagsByThought: Database.Statement;
-  getTagsBySession: Database.Statement;
-}
-
-// =============================================================================
-// PersistenceLayer
+// PersistenceLayer (sql.js)
 // =============================================================================
 
 export class PersistenceLayer {
-  private db: Database.Database;
-  private stmts: PreparedStatements;
+  private db: SqlJsDatabase;
+  private dbPath: string;
 
-  constructor(dbPath: string) {
-    // Ensure directory exists for file-based DBs
+  private constructor(db: SqlJsDatabase, dbPath: string) {
+    this.db = db;
+    this.dbPath = dbPath;
+    this.db.run('PRAGMA foreign_keys = ON;');
+    this.db.run(SCHEMA_SQL);
+    this.save();
+  }
+
+  public static async create(dbPath: string): Promise<PersistenceLayer> {
+    const SQL = await initSqlJs();
+
     if (dbPath !== ':memory:') {
       const dir = path.dirname(dbPath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
+      if (dir && dir !== '.' && !fs.existsSync(dir)) {
+        try {
+          fs.mkdirSync(dir, { recursive: true });
+        } catch (error) {
+          throw new Error(
+            `Cannot create database directory: ${dir}. Check folder permissions.`
+          );
+        }
       }
     }
 
-    this.db = new Database(dbPath);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('busy_timeout = 5000');
-    this.db.pragma('foreign_keys = ON');
+    let db: SqlJsDatabase;
+    if (dbPath !== ':memory:' && fs.existsSync(dbPath)) {
+      try {
+        const fileBuffer = fs.readFileSync(dbPath);
+        db = new SQL.Database(fileBuffer);
+      } catch (e) {
+        db = new SQL.Database();
+      }
+    } else {
+      db = new SQL.Database();
+    }
 
-    this.db.exec(SCHEMA_SQL);
-    this.stmts = this.prepareStatements();
+    return new PersistenceLayer(db, dbPath);
+  }
+
+  public save(): void {
+    if (this.dbPath !== ':memory:') {
+      try {
+        const data = this.db.export();
+        const buffer = Buffer.from(data);
+        fs.writeFileSync(this.dbPath, buffer);
+      } catch (error) {
+        console.error('Failed to save database to disk:', error);
+      }
+    }
   }
 
   // ===========================================================================
@@ -162,50 +166,110 @@ export class PersistenceLayer {
   createSession(name: string, description?: string): string {
     const id = randomUUID();
     const now = Date.now();
-    this.stmts.insertSession.run(id, name, description || null, 'active', now, now);
+    this.db.run(
+      'INSERT INTO sessions (id, name, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)',
+      [id, name, description || null, 'active', now, now]
+    );
+    this.save();
     return id;
   }
 
   updateSessionName(id: string, name: string, description?: string): void {
     const now = Date.now();
-    this.stmts.updateSessionName.run(name, description ?? null, now, id);
+    this.db.run(
+      'UPDATE sessions SET name = ?, description = ?, updated_at = ? WHERE id = ?',
+      [name, description ?? null, now, id]
+    );
+    this.save();
   }
 
   updateSessionTimestamp(id: string): void {
-    this.stmts.updateSessionTimestamp.run(Date.now(), id);
+    this.db.run('UPDATE sessions SET updated_at = ? WHERE id = ?', [
+      Date.now(),
+      id,
+    ]);
+    this.save();
   }
 
   updateSessionStatus(id: string, status: string): void {
-    this.stmts.updateSessionStatus.run(status, Date.now(), id);
+    this.db.run('UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?', [
+      status,
+      Date.now(),
+      id,
+    ]);
+    this.save();
   }
 
   getSession(id: string): SessionMetadata | null {
-    const row = this.stmts.getSession.get(id) as SessionRow | undefined;
-    if (!row) return null;
-    return this.rowToSessionMetadata(row);
+    const stmt = this.db.prepare(`
+      SELECT s.*,
+        (SELECT COUNT(*) FROM thoughts WHERE session_id = s.id) as thought_count,
+        (SELECT COUNT(*) FROM branches WHERE session_id = s.id) as branch_count
+      FROM sessions s WHERE s.id = ?
+    `);
+    stmt.bind([id]);
+    if (stmt.step()) {
+      const row = stmt.getAsObject() as unknown as SessionRow;
+      stmt.free();
+      return this.rowToSessionMetadata(row);
+    }
+    stmt.free();
+    return null;
   }
 
-  listSessions(options?: { status?: string; limit?: number; offset?: number }): SessionMetadata[] {
+  listSessions(options?: {
+    status?: string;
+    limit?: number;
+    offset?: number;
+  }): SessionMetadata[] {
     const limit = options?.limit ?? 20;
     const offset = options?.offset ?? 0;
 
-    let rows: SessionRow[];
+    let sql = `
+      SELECT s.*,
+        (SELECT COUNT(*) FROM thoughts WHERE session_id = s.id) as thought_count,
+        (SELECT COUNT(*) FROM branches WHERE session_id = s.id) as branch_count
+      FROM sessions s
+    `;
+    const params: SqlValue[] = [];
+
     if (options?.status) {
-      rows = this.stmts.listSessionsByStatus.all(options.status, limit, offset) as SessionRow[];
-    } else {
-      rows = this.stmts.listSessions.all(limit, offset) as SessionRow[];
+      sql += ' WHERE s.status = ?';
+      params.push(options.status);
     }
 
-    return rows.map(row => this.rowToSessionMetadata(row));
+    sql += ' ORDER BY s.updated_at DESC LIMIT ? OFFSET ?';
+    params.push(limit, offset);
+
+    const stmt = this.db.prepare(sql);
+    stmt.bind(params);
+
+    const rows: SessionRow[] = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject() as unknown as SessionRow);
+    }
+    stmt.free();
+
+    return rows.map((row) => this.rowToSessionMetadata(row));
   }
 
   countSessions(status?: string): number {
+    let sql = 'SELECT COUNT(*) as count FROM sessions';
+    const params: SqlValue[] = [];
     if (status) {
-      const row = this.stmts.countSessionsByStatus.get(status) as { count: number };
-      return row.count;
+      sql += ' WHERE status = ?';
+      params.push(status);
     }
-    const row = this.stmts.countSessions.get() as { count: number };
-    return row.count;
+
+    const stmt = this.db.prepare(sql);
+    stmt.bind(params);
+    let count = 0;
+    if (stmt.step()) {
+      const res = stmt.getAsObject() as { count: number };
+      count = res.count;
+    }
+    stmt.free();
+    return count;
   }
 
   // ===========================================================================
@@ -214,20 +278,24 @@ export class PersistenceLayer {
 
   insertThought(sessionId: string, thought: ThoughtData): void {
     const type = this.classifyThoughtType(thought);
-    this.stmts.insertThought.run(
-      sessionId,
-      thought.thoughtNumber,
-      thought.thought,
-      type,
-      thought.branchId || null,
-      null, // agent_id — Phase 2
-      thought.isRevision ? 1 : 0,
-      thought.revisesThought || null,
-      thought.branchFromThought || null,
-      Date.now()
+    this.db.run(
+      `INSERT INTO thoughts (session_id, thought_number, thought, type, branch_id, agent_id,
+       is_revision, revises_thought, branch_from_thought, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        sessionId,
+        thought.thoughtNumber,
+        thought.thought,
+        type,
+        thought.branchId || null,
+        null,
+        thought.isRevision ? 1 : 0,
+        thought.revisesThought || null,
+        thought.branchFromThought || null,
+        Date.now(),
+      ]
     );
 
-    // Persist tags if present
     if (thought.tags && thought.tags.length > 0) {
       this.setTags(sessionId, thought.thoughtNumber, thought.tags);
     }
@@ -236,17 +304,26 @@ export class PersistenceLayer {
   }
 
   getThoughts(sessionId: string, branchId?: string): ThoughtData[] {
-    let rows: ThoughtRow[];
+    let sql = 'SELECT * FROM thoughts WHERE session_id = ?';
+    const params: SqlValue[] = [sessionId];
+
     if (branchId) {
-      rows = this.stmts.getThoughtsByBranch.all(sessionId, branchId) as ThoughtRow[];
-    } else {
-      rows = this.stmts.getThoughtsBySession.all(sessionId) as ThoughtRow[];
+      sql += ' AND branch_id = ?';
+      params.push(branchId);
     }
+    sql += ' ORDER BY thought_number ASC';
 
-    // Batch-load tags for all thoughts in this session
+    const stmt = this.db.prepare(sql);
+    stmt.bind(params);
+
+    const rows: ThoughtRow[] = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject() as unknown as ThoughtRow);
+    }
+    stmt.free();
+
     const allTags = this.getTagsBySession(sessionId);
-
-    return rows.map(row => this.rowToThoughtData(row, allTags));
+    return rows.map((row) => this.rowToThoughtData(row, allTags));
   }
 
   // ===========================================================================
@@ -254,32 +331,63 @@ export class PersistenceLayer {
   // ===========================================================================
 
   insertBranch(sessionId: string, branch: BranchData): void {
-    this.stmts.insertBranch.run(
-      branch.branchId,
-      sessionId,
-      branch.originThought,
-      branch.status,
-      branch.conclusion || null,
-      null, // agent_id — Phase 2
-      null, // merge_strategy
-      branch.createdAt
+    this.db.run(
+      `INSERT INTO branches (id, session_id, origin_thought, status, conclusion, agent_id,
+       merge_strategy, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        branch.branchId,
+        sessionId,
+        branch.originThought,
+        branch.status,
+        branch.conclusion || null,
+        null,
+        null,
+        branch.createdAt,
+      ]
     );
     this.updateSessionTimestamp(sessionId);
   }
 
-  updateBranchClose(sessionId: string, branchId: string, conclusion: string | undefined, closedAt: number): void {
-    this.stmts.updateBranchStatus.run('closed', conclusion || null, null, closedAt, null, sessionId, branchId);
+  updateBranchClose(
+    sessionId: string,
+    branchId: string,
+    conclusion: string | undefined,
+    closedAt: number
+  ): void {
+    this.db.run(
+      `UPDATE branches SET status = ?, conclusion = ?, closed_at = ?
+       WHERE session_id = ? AND id = ?`,
+      ['closed', conclusion || null, closedAt, sessionId, branchId]
+    );
     this.updateSessionTimestamp(sessionId);
   }
 
-  updateBranchMerge(sessionId: string, branchId: string, strategy: string, mergedAt: number): void {
-    this.stmts.updateBranchMerge.run('merged', strategy, mergedAt, sessionId, branchId);
+  updateBranchMerge(
+    sessionId: string,
+    branchId: string,
+    strategy: string,
+    mergedAt: number
+  ): void {
+    this.db.run(
+      'UPDATE branches SET status = ?, merge_strategy = ?, merged_at = ? WHERE session_id = ? AND id = ?',
+      ['merged', strategy, mergedAt, sessionId, branchId]
+    );
     this.updateSessionTimestamp(sessionId);
   }
 
   getBranches(sessionId: string): BranchData[] {
-    const rows = this.stmts.getBranchesBySession.all(sessionId) as BranchRow[];
-    return rows.map(row => this.rowToBranchData(row));
+    const stmt = this.db.prepare(
+      'SELECT * FROM branches WHERE session_id = ? ORDER BY created_at ASC'
+    );
+    stmt.bind([sessionId]);
+
+    const rows: BranchRow[] = [];
+    while (stmt.step()) {
+      rows.push(stmt.getAsObject() as unknown as BranchRow);
+    }
+    stmt.free();
+
+    return rows.map((row) => this.rowToBranchData(row));
   }
 
   // ===========================================================================
@@ -287,21 +395,28 @@ export class PersistenceLayer {
   // ===========================================================================
 
   setTags(sessionId: string, thoughtNumber: number, tags: string[]): void {
-    // Replace all tags for this thought (delete + re-insert in a transaction)
-    const setTagsTxn = this.db.transaction((sid: string, tn: number, tagList: string[]) => {
-      this.stmts.deleteTags.run(sid, tn);
-      for (const tag of tagList) {
-        this.stmts.insertTag.run(sid, tn, tag);
-      }
-    });
-    setTagsTxn(sessionId, thoughtNumber, tags);
+    this.db.run(
+      'DELETE FROM tags WHERE session_id = ? AND thought_number = ?',
+      [sessionId, thoughtNumber]
+    );
+    for (const tag of tags) {
+      this.db.run(
+        'INSERT OR IGNORE INTO tags (session_id, thought_number, tag) VALUES (?, ?, ?)',
+        [sessionId, thoughtNumber, tag]
+      );
+    }
     this.updateSessionTimestamp(sessionId);
   }
 
   private getTagsBySession(sessionId: string): Map<number, string[]> {
-    const rows = this.stmts.getTagsBySession.all(sessionId) as TagRow[];
+    const stmt = this.db.prepare(
+      'SELECT thought_number, tag FROM tags WHERE session_id = ? ORDER BY thought_number ASC'
+    );
+    stmt.bind([sessionId]);
+
     const tagMap = new Map<number, string[]>();
-    for (const row of rows) {
+    while (stmt.step()) {
+      const row = stmt.getAsObject() as unknown as TagRow;
       const existing = tagMap.get(row.thought_number);
       if (existing) {
         existing.push(row.tag);
@@ -309,6 +424,7 @@ export class PersistenceLayer {
         tagMap.set(row.thought_number, [row.tag]);
       }
     }
+    stmt.free();
     return tagMap;
   }
 
@@ -316,18 +432,18 @@ export class PersistenceLayer {
   // Full Session Load (hydration)
   // ===========================================================================
 
-  loadSession(id: string): { metadata: SessionMetadata; state: SessionState } | null {
+  loadSession(
+    id: string
+  ): { metadata: SessionMetadata; state: SessionState } | null {
     const metadata = this.getSession(id);
     if (!metadata) return null;
 
     const thoughts = this.getThoughts(id);
     const branches = this.getBranches(id);
 
-    // Build branches record keyed by branchId
     const branchRecord: Record<string, BranchData> = {};
     for (const branch of branches) {
-      // Attach thoughts that belong to this branch
-      branch.thoughts = thoughts.filter(t => t.branchId === branch.branchId);
+      branch.thoughts = thoughts.filter((t) => t.branchId === branch.branchId);
       branchRecord[branch.branchId] = branch;
     }
 
@@ -336,115 +452,20 @@ export class PersistenceLayer {
       state: {
         thoughtHistory: thoughts,
         branches: branchRecord,
-        summaries: [], // Phase 2+
-        checkpoints: [], // Phase 2+
-      }
+        summaries: [],
+        checkpoints: [],
+      },
     };
   }
 
-  // ===========================================================================
-  // Cleanup
-  // ===========================================================================
-
   close(): void {
+    this.save();
     this.db.close();
   }
 
   // ===========================================================================
   // Internal Helpers
   // ===========================================================================
-
-  private prepareStatements(): PreparedStatements {
-    return {
-      // Sessions
-      insertSession: this.db.prepare(
-        'INSERT INTO sessions (id, name, description, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)'
-      ),
-      updateSessionName: this.db.prepare(
-        'UPDATE sessions SET name = ?, description = ?, updated_at = ? WHERE id = ?'
-      ),
-      updateSessionTimestamp: this.db.prepare(
-        'UPDATE sessions SET updated_at = ? WHERE id = ?'
-      ),
-      updateSessionStatus: this.db.prepare(
-        'UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?'
-      ),
-      getSession: this.db.prepare(`
-        SELECT s.*,
-          (SELECT COUNT(*) FROM thoughts WHERE session_id = s.id) as thought_count,
-          (SELECT COUNT(*) FROM branches WHERE session_id = s.id) as branch_count
-        FROM sessions s WHERE s.id = ?
-      `),
-      listSessions: this.db.prepare(`
-        SELECT s.*,
-          (SELECT COUNT(*) FROM thoughts WHERE session_id = s.id) as thought_count,
-          (SELECT COUNT(*) FROM branches WHERE session_id = s.id) as branch_count
-        FROM sessions s
-        ORDER BY s.updated_at DESC
-        LIMIT ? OFFSET ?
-      `),
-      listSessionsByStatus: this.db.prepare(`
-        SELECT s.*,
-          (SELECT COUNT(*) FROM thoughts WHERE session_id = s.id) as thought_count,
-          (SELECT COUNT(*) FROM branches WHERE session_id = s.id) as branch_count
-        FROM sessions s
-        WHERE s.status = ?
-        ORDER BY s.updated_at DESC
-        LIMIT ? OFFSET ?
-      `),
-      countSessions: this.db.prepare('SELECT COUNT(*) as count FROM sessions'),
-      countSessionsByStatus: this.db.prepare('SELECT COUNT(*) as count FROM sessions WHERE status = ?'),
-
-      // Thoughts
-      insertThought: this.db.prepare(
-        `INSERT INTO thoughts (session_id, thought_number, thought, type, branch_id, agent_id,
-         is_revision, revises_thought, branch_from_thought, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      ),
-      getThoughtsBySession: this.db.prepare(
-        'SELECT * FROM thoughts WHERE session_id = ? ORDER BY thought_number ASC'
-      ),
-      getThoughtsByBranch: this.db.prepare(
-        'SELECT * FROM thoughts WHERE session_id = ? AND branch_id = ? ORDER BY thought_number ASC'
-      ),
-      countThoughtsBySession: this.db.prepare(
-        'SELECT COUNT(*) as count FROM thoughts WHERE session_id = ?'
-      ),
-
-      // Branches
-      insertBranch: this.db.prepare(
-        `INSERT INTO branches (id, session_id, origin_thought, status, conclusion, agent_id,
-         merge_strategy, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ),
-      updateBranchStatus: this.db.prepare(
-        `UPDATE branches SET status = ?, conclusion = ?, merge_strategy = ?, closed_at = ?, merged_at = ?
-         WHERE session_id = ? AND id = ?`
-      ),
-      updateBranchMerge: this.db.prepare(
-        'UPDATE branches SET status = ?, merge_strategy = ?, merged_at = ? WHERE session_id = ? AND id = ?'
-      ),
-      getBranchesBySession: this.db.prepare(
-        'SELECT * FROM branches WHERE session_id = ? ORDER BY created_at ASC'
-      ),
-      countBranchesBySession: this.db.prepare(
-        'SELECT COUNT(*) as count FROM branches WHERE session_id = ?'
-      ),
-
-      // Tags
-      deleteTags: this.db.prepare(
-        'DELETE FROM tags WHERE session_id = ? AND thought_number = ?'
-      ),
-      insertTag: this.db.prepare(
-        'INSERT OR IGNORE INTO tags (session_id, thought_number, tag) VALUES (?, ?, ?)'
-      ),
-      getTagsByThought: this.db.prepare(
-        'SELECT tag FROM tags WHERE session_id = ? AND thought_number = ?'
-      ),
-      getTagsBySession: this.db.prepare(
-        'SELECT thought_number, tag FROM tags WHERE session_id = ? ORDER BY thought_number ASC'
-      ),
-    };
-  }
 
   private classifyThoughtType(thought: ThoughtData): string {
     if (thought.type) return thought.type;
@@ -458,28 +479,33 @@ export class PersistenceLayer {
       id: row.id,
       name: row.name,
       description: row.description || undefined,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
-      thoughtCount: row.thought_count,
-      branchCount: row.branch_count,
+      createdAt: Number(row.created_at),
+      updatedAt: Number(row.updated_at),
+      thoughtCount: Number(row.thought_count),
+      branchCount: Number(row.branch_count),
     };
   }
 
-  private rowToThoughtData(row: ThoughtRow, tagMap: Map<number, string[]>): ThoughtData {
+  private rowToThoughtData(
+    row: ThoughtRow,
+    tagMap: Map<number, string[]>
+  ): ThoughtData {
     const thought: ThoughtData = {
       thought: row.thought,
-      thoughtNumber: row.thought_number,
-      totalThoughts: row.thought_number, // will be corrected by caller
-      nextThoughtNeeded: true, // will be corrected by caller
+      thoughtNumber: Number(row.thought_number),
+      totalThoughts: Number(row.thought_number),
+      nextThoughtNeeded: true,
     };
 
     if (row.is_revision) thought.isRevision = true;
-    if (row.revises_thought) thought.revisesThought = row.revises_thought;
-    if (row.branch_from_thought) thought.branchFromThought = row.branch_from_thought;
+    if (row.revises_thought) thought.revisesThought = Number(row.revises_thought);
+    if (row.branch_from_thought)
+      thought.branchFromThought = Number(row.branch_from_thought);
     if (row.branch_id) thought.branchId = row.branch_id;
-    if (row.type && row.type !== 'thought') thought.type = row.type as ThoughtData['type'];
+    if (row.type && row.type !== 'thought')
+      thought.type = row.type as ThoughtData['type'];
 
-    const tags = tagMap.get(row.thought_number);
+    const tags = tagMap.get(Number(row.thought_number));
     if (tags && tags.length > 0) thought.tags = tags;
 
     return thought;
@@ -488,22 +514,22 @@ export class PersistenceLayer {
   private rowToBranchData(row: BranchRow): BranchData {
     const branch: BranchData = {
       branchId: row.id,
-      originThought: row.origin_thought,
-      thoughts: [], // populated by caller during loadSession
+      originThought: Number(row.origin_thought),
+      thoughts: [],
       status: row.status as BranchData['status'],
-      createdAt: row.created_at,
+      createdAt: Number(row.created_at),
     };
 
     if (row.conclusion) branch.conclusion = row.conclusion;
-    if (row.closed_at) branch.closedAt = row.closed_at;
-    if (row.merged_at) branch.mergedAt = row.merged_at;
+    if (row.closed_at) branch.closedAt = Number(row.closed_at);
+    if (row.merged_at) branch.mergedAt = Number(row.merged_at);
 
     return branch;
   }
 }
 
 // =============================================================================
-// Row Types (SQLite result shapes)
+// Row Types
 // =============================================================================
 
 interface SessionRow {
@@ -561,13 +587,13 @@ export function resolveDbPath(): string {
   }
 
   if (envPath) {
-    // Expand ~ to home directory
     if (envPath.startsWith('~')) {
-      return path.join(process.env.HOME || '', envPath.slice(1));
+      const homeDir = process.env.HOME || process.env.USERPROFILE || '';
+      const relativePart = envPath.slice(1).replace(/^[/\\]+/, '');
+      return path.resolve(path.join(homeDir, relativePart));
     }
     return path.resolve(envPath);
   }
 
-  // Default: project-local .maxential/thinking.db
-  return path.join(process.cwd(), '.maxential', 'thinking.db');
+  return path.resolve(path.join(process.cwd(), '.maxential', 'thinking.db'));
 }
