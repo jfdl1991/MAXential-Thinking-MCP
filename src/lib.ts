@@ -40,8 +40,6 @@ function logInfo(msg: string): void {
   }
 }
 
-
-
 export class SequentialThinkingServer {
   private thoughtHistory: ThoughtData[] = [];
   private branches: Record<string, BranchData> = {};
@@ -58,11 +56,12 @@ export class SequentialThinkingServer {
   constructor() {
     this.disableThoughtLogging = (process.env.DISABLE_THOUGHT_LOGGING || "").toLowerCase() === "true";
     this.echoThoughts = (process.env.MAXENTIAL_ECHO_THOUGHTS || "true").toLowerCase() !== "false";
+  }
 
-    // Initialize persistence layer
+  public async initializePersistence(): Promise<void> {
     try {
       const dbPath = resolveDbPath();
-      this.persistence = new PersistenceLayer(dbPath);
+      this.persistence = await PersistenceLayer.create(dbPath);
       logInfo(`Persistence enabled: ${dbPath}`);
     } catch (error) {
       logError('Failed to initialize persistence — running in-memory only', error);
@@ -129,18 +128,15 @@ export class SequentialThinkingServer {
 
     this.thoughtHistory.push(thoughtData);
 
-    // Add to branch if we're on one
     if (this.activeBranchId && this.branches[this.activeBranchId]) {
       this.branches[this.activeBranchId].thoughts.push(thoughtData);
     }
 
-    // Write-through to persistence
     if (this.persistence) {
       this.ensureSession();
       this.persistence.insertThought(this.currentSessionId!, thoughtData);
     }
 
-    // Log if enabled
     if (!this.disableThoughtLogging) {
       const formatted = this.formatThought(thoughtData);
       console.error(formatted);
@@ -229,7 +225,6 @@ export class SequentialThinkingServer {
       this.isComplete = true;
       const thoughtData = this.addThought(`CONCLUSION: ${data.conclusion}`);
 
-      // Mark session as complete in persistence
       if (this.persistence && this.currentSessionId) {
         this.persistence.updateSessionStatus(this.currentSessionId, 'complete');
       }
@@ -246,7 +241,6 @@ export class SequentialThinkingServer {
     }
   }
 
-
   public reset(input: unknown): { content: Array<{ type: string; text: string }>; isError?: boolean } {
     try {
       const data = input as Record<string, unknown>;
@@ -260,12 +254,10 @@ export class SequentialThinkingServer {
         branches: Object.keys(this.branches).length
       };
 
-      // Mark current session as complete in persistence
       if (this.persistence && this.currentSessionId) {
         this.persistence.updateSessionStatus(this.currentSessionId, 'complete');
       }
 
-      // Reset all state
       this.thoughtHistory = [];
       this.branches = {};
       this.activeBranchId = undefined;
@@ -304,7 +296,6 @@ export class SequentialThinkingServer {
 
       const originThought = this.currentThoughtNumber;
 
-      // Create the branch
       const branchData: BranchData = {
         branchId: data.branchId,
         originThought,
@@ -314,15 +305,12 @@ export class SequentialThinkingServer {
       };
       this.branches[data.branchId] = branchData;
 
-      // Write-through to persistence
       if (this.persistence && this.currentSessionId) {
         this.persistence.insertBranch(this.currentSessionId, branchData);
       }
 
-      // Switch to the new branch
       this.activeBranchId = data.branchId;
 
-      // Add a branch-start thought
       const thoughtData = this.addThought(`BRANCH START: ${data.reason}`, {
         branchId: data.branchId,
         branchFromThought: originThought
@@ -345,7 +333,6 @@ export class SequentialThinkingServer {
       const data = input as Record<string, unknown>;
       const branchId = data.branchId as string | undefined;
 
-      // Treat "main" the same as omitting branchId (git muscle memory)
       const isMainSwitch = !branchId || branchId === 'main';
 
       if (!isMainSwitch) {
@@ -357,7 +344,6 @@ export class SequentialThinkingServer {
         }
         this.activeBranchId = branchId;
       } else {
-        // Switch to main (no branch)
         this.activeBranchId = undefined;
       }
 
@@ -403,7 +389,6 @@ export class SequentialThinkingServer {
 
       let thoughts = this.thoughtHistory;
 
-      // Filter by branch if specified
       if (branchId) {
         if (!this.branches[branchId]) {
           throw new BranchError(`Branch '${branchId}' not found`);
@@ -411,7 +396,6 @@ export class SequentialThinkingServer {
         thoughts = this.branches[branchId].thoughts;
       }
 
-      // Apply limit
       if (limit && limit > 0) {
         thoughts = thoughts.slice(-limit);
       }
@@ -433,7 +417,6 @@ export class SequentialThinkingServer {
     }
   }
 
-
   // ===========================================================================
   // Organization Tools (v2.2)
   // ===========================================================================
@@ -451,7 +434,6 @@ export class SequentialThinkingServer {
         throw new Error(`Thought ${data.thoughtNumber} not found`);
       }
 
-      // Initialize tags if not present
       if (!thought.tags) {
         thought.tags = [];
       }
@@ -459,7 +441,6 @@ export class SequentialThinkingServer {
       const added: string[] = [];
       const removed: string[] = [];
 
-      // Add tags
       if (Array.isArray(data.add)) {
         for (const tag of data.add) {
           const normalized = String(tag).toLowerCase().trim();
@@ -470,7 +451,6 @@ export class SequentialThinkingServer {
         }
       }
 
-      // Remove tags
       if (Array.isArray(data.remove)) {
         for (const tag of data.remove) {
           const normalized = String(tag).toLowerCase().trim();
@@ -482,7 +462,6 @@ export class SequentialThinkingServer {
         }
       }
 
-      // Write-through to persistence
       if (this.persistence && this.currentSessionId && (added.length > 0 || removed.length > 0)) {
         this.persistence.setTags(this.currentSessionId, data.thoughtNumber as number, thought.tags);
       }
@@ -511,7 +490,6 @@ export class SequentialThinkingServer {
 
       let thoughts = this.thoughtHistory;
 
-      // Filter by branch
       if (branchId) {
         if (!this.branches[branchId]) {
           throw new BranchError(`Branch '${branchId}' not found`);
@@ -519,13 +497,11 @@ export class SequentialThinkingServer {
         thoughts = this.branches[branchId].thoughts;
       }
 
-      // Filter by query (case-insensitive)
       if (query) {
         const lowerQuery = query.toLowerCase();
         thoughts = thoughts.filter(t => t.thought.toLowerCase().includes(lowerQuery));
       }
 
-      // Filter by tags (must have ALL specified tags)
       if (tags && tags.length > 0) {
         const normalizedTags = tags.map(t => t.toLowerCase().trim());
         thoughts = thoughts.filter(t => {
@@ -567,10 +543,8 @@ export class SequentialThinkingServer {
         return this.makeResponse({ format: 'json', content: JSON.stringify(exportData, null, 2) });
       }
 
-      // Markdown format
       let md = '# Thinking Chain\n\n';
 
-      // Main thread thoughts (not in branches)
       const mainThoughts = this.thoughtHistory.filter(t => !t.branchId);
       if (mainThoughts.length > 0) {
         md += '## Main Thread\n\n';
@@ -579,7 +553,6 @@ export class SequentialThinkingServer {
         }
       }
 
-      // Branch thoughts
       for (const [id, branch] of Object.entries(this.branches)) {
         if (branchId && id !== branchId) continue;
         md += `\n---\n\n## Branch: ${id}\n`;
@@ -622,7 +595,6 @@ export class SequentialThinkingServer {
         return this.makeResponse({ format: 'ascii', content: this.generateAsciiTree(showContent) });
       }
 
-      // Mermaid format
       return this.makeResponse({ format: 'mermaid', content: this.generateMermaidDiagram(showContent) });
     } catch (error) {
       return this.makeError(error);
@@ -636,18 +608,15 @@ export class SequentialThinkingServer {
 
     let output = 'Thinking Chain\n==============\n\n';
 
-    // Group thoughts by branch
     const mainThoughts = this.thoughtHistory.filter(t => !t.branchId);
     const branchStarts: Record<number, string[]> = {};
 
-    // Find where branches start
     for (const [id, branch] of Object.entries(this.branches)) {
       const origin = branch.originThought;
       if (!branchStarts[origin]) branchStarts[origin] = [];
       branchStarts[origin].push(id);
     }
 
-    // Build main line
     let line = '';
     for (const t of mainThoughts) {
       const label = showContent ? `T${t.thoughtNumber}:"${t.thought.substring(0, 20)}..."` : `T${t.thoughtNumber}`;
@@ -660,7 +629,6 @@ export class SequentialThinkingServer {
     }
     output += line || '(empty)';
 
-    // Show revisions
     const revisions = this.thoughtHistory.filter(t => t.isRevision);
     if (revisions.length > 0) {
       output += '\n\nRevisions:\n';
@@ -679,7 +647,6 @@ export class SequentialThinkingServer {
 
     let mermaid = 'graph TD\n';
 
-    // Define nodes
     for (const t of this.thoughtHistory) {
       const label = showContent
         ? `#${t.thoughtNumber}: ${t.thought.substring(0, 30).replace(/"/g, "'").replace(/\n/g, ' ')}...`
@@ -689,36 +656,30 @@ export class SequentialThinkingServer {
 
     mermaid += '\n';
 
-    // Define edges (sequential flow within main/branches)
     let prevMain: number | null = null;
     const branchPrev: Record<string, number> = {};
 
     for (const t of this.thoughtHistory) {
       if (t.branchFromThought) {
-        // Start of a branch
         mermaid += `    T${t.branchFromThought} --> T${t.thoughtNumber}\n`;
         branchPrev[t.branchId!] = t.thoughtNumber;
       } else if (t.branchId) {
-        // Continuation in branch
         if (branchPrev[t.branchId]) {
           mermaid += `    T${branchPrev[t.branchId]} --> T${t.thoughtNumber}\n`;
         }
         branchPrev[t.branchId] = t.thoughtNumber;
       } else {
-        // Main thread
         if (prevMain !== null) {
           mermaid += `    T${prevMain} --> T${t.thoughtNumber}\n`;
         }
         prevMain = t.thoughtNumber;
       }
 
-      // Revision link (dotted)
       if (t.isRevision && t.revisesThought) {
         mermaid += `    T${t.thoughtNumber} -.revises.-> T${t.revisesThought}\n`;
       }
     }
 
-    // Subgraphs for branches
     for (const [id, branch] of Object.entries(this.branches)) {
       const thoughtNums = branch.thoughts.map(t => `T${t.thoughtNumber}`).join('\n        ');
       if (thoughtNums) {
@@ -851,7 +812,6 @@ export class SequentialThinkingServer {
         branch.conclusion = data.conclusion;
       }
 
-      // Write-through to persistence
       if (this.persistence && this.currentSessionId) {
         this.persistence.updateBranchClose(this.currentSessionId, data.branchId, branch.conclusion, branch.closedAt);
       }
@@ -901,7 +861,6 @@ export class SequentialThinkingServer {
       branch.status = 'merged';
       branch.mergedAt = mergedAt;
 
-      // Write-through to persistence
       if (this.persistence && this.currentSessionId) {
         this.persistence.updateBranchMerge(this.currentSessionId, data.branchId, strategy, mergedAt);
       }
@@ -953,7 +912,6 @@ export class SequentialThinkingServer {
         throw new Error('Invalid name: must be a string');
       }
 
-      // If no session exists yet, create one
       this.ensureSession();
 
       const description = typeof data.description === 'string' ? data.description : undefined;
@@ -991,12 +949,10 @@ export class SequentialThinkingServer {
         throw new Error(`Session '${data.id}' not found`);
       }
 
-      // Hydrate in-memory state
       this.thoughtHistory = loaded.state.thoughtHistory;
       this.branches = loaded.state.branches;
       this.currentSessionId = data.id;
 
-      // Restore thought counter and completion state
       if (this.thoughtHistory.length > 0) {
         this.currentThoughtNumber = Math.max(...this.thoughtHistory.map(t => t.thoughtNumber));
         const lastThought = this.thoughtHistory[this.thoughtHistory.length - 1];
@@ -1006,7 +962,6 @@ export class SequentialThinkingServer {
         this.isComplete = false;
       }
 
-      // Restore active branch (find the last active one, or none)
       this.activeBranchId = undefined;
       for (const branch of Object.values(this.branches)) {
         if (branch.status === 'active') {
@@ -1015,7 +970,6 @@ export class SequentialThinkingServer {
         }
       }
 
-      // Mark session as active again
       this.persistence.updateSessionStatus(data.id, 'active');
 
       return this.makeResponse({
@@ -1083,23 +1037,19 @@ export class SequentialThinkingServer {
 
       const maxLength = typeof data.maxLength === 'number' ? data.maxLength : 2000;
 
-      // Build summary from the session's thought history
       const thoughts = loaded.state.thoughtHistory;
       const branches = Object.values(loaded.state.branches);
 
-      // Extract key findings: conclusions, tagged thoughts, revisions
       const keyFindings: string[] = [];
       const summaryParts: string[] = [];
 
       summaryParts.push(`Session "${loaded.metadata.name}" — ${thoughts.length} thoughts across ${branches.length + 1} threads (main + ${branches.length} branches).`);
 
-      // Main thread conclusions
       const conclusions = thoughts.filter(t => t.thought.startsWith('CONCLUSION:'));
       for (const c of conclusions) {
         keyFindings.push(c.thought.replace('CONCLUSION: ', ''));
       }
 
-      // Branch conclusions
       for (const branch of branches) {
         if (branch.conclusion) {
           keyFindings.push(`[${branch.branchId}] ${branch.conclusion}`);
@@ -1108,7 +1058,6 @@ export class SequentialThinkingServer {
         summaryParts.push(`Branch "${branch.branchId}": ${branch.thoughts.length} thoughts, ${statusNote}.`);
       }
 
-      // Tagged thoughts as key findings
       const taggedThoughts = thoughts.filter(t => t.tags && t.tags.length > 0);
       for (const t of taggedThoughts) {
         if (!t.thought.startsWith('CONCLUSION:') && !t.thought.startsWith('BRANCH START:')) {
@@ -1116,7 +1065,6 @@ export class SequentialThinkingServer {
         }
       }
 
-      // Truncate summary to maxLength
       let summary = summaryParts.join('\n');
       if (summary.length > maxLength) {
         summary = summary.substring(0, maxLength - 3) + '...';
