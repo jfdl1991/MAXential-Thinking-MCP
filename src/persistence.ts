@@ -10,8 +10,10 @@ import {
 } from './types/index.js';
 
 // =============================================================================
-// Schema
+// Database Schema
 // =============================================================================
+// This schema defines all SQLite tables needed for storing reasoning sessions,
+// thoughts, branches, tags, agent contexts, and synthesized summaries.
 
 const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -101,8 +103,11 @@ CREATE TABLE IF NOT EXISTS syntheses (
 `;
 
 // =============================================================================
-// PersistenceLayer (sql.js)
+// PersistenceLayer Class (powered by sql.js)
 // =============================================================================
+// Provides full database CRUD operations for thinking chains, branches, and
+// sessions using sql.js (pure JavaScript/WebAssembly SQLite). It writes changes
+// back to disk whenever data is inserted or updated.
 
 export class PersistenceLayer {
   private db: SqlJsDatabase;
@@ -111,14 +116,20 @@ export class PersistenceLayer {
   private constructor(db: SqlJsDatabase, dbPath: string) {
     this.db = db;
     this.dbPath = dbPath;
+
+    // Enable foreign key constraints and initialize table schema
     this.db.run('PRAGMA foreign_keys = ON;');
     this.db.run(SCHEMA_SQL);
     this.save();
   }
 
+  /**
+   * Factory method to asynchronously initialize sql.js engine and load or create database file.
+   */
   public static async create(dbPath: string): Promise<PersistenceLayer> {
     const SQL = await initSqlJs();
 
+    // Safely ensure directory structure exists if file persistence is enabled
     if (dbPath !== ':memory:') {
       const dir = path.dirname(dbPath);
       if (dir && dir !== '.' && !fs.existsSync(dir)) {
@@ -147,6 +158,9 @@ export class PersistenceLayer {
     return new PersistenceLayer(db, dbPath);
   }
 
+  /**
+   * Flushes current in-memory SQLite database state to disk.
+   */
   public save(): void {
     if (this.dbPath !== ':memory:') {
       try {
@@ -163,6 +177,9 @@ export class PersistenceLayer {
   // Session Operations
   // ===========================================================================
 
+  /**
+   * Creates a new session record with a unique UUID.
+   */
   createSession(name: string, description?: string): string {
     const id = randomUUID();
     const now = Date.now();
@@ -174,6 +191,9 @@ export class PersistenceLayer {
     return id;
   }
 
+  /**
+   * Updates session metadata name and optional description.
+   */
   updateSessionName(id: string, name: string, description?: string): void {
     const now = Date.now();
     this.db.run(
@@ -183,6 +203,9 @@ export class PersistenceLayer {
     this.save();
   }
 
+  /**
+   * Updates session timestamp on active changes.
+   */
   updateSessionTimestamp(id: string): void {
     this.db.run('UPDATE sessions SET updated_at = ? WHERE id = ?', [
       Date.now(),
@@ -191,6 +214,9 @@ export class PersistenceLayer {
     this.save();
   }
 
+  /**
+   * Updates session status (active, complete, archived).
+   */
   updateSessionStatus(id: string, status: string): void {
     this.db.run('UPDATE sessions SET status = ?, updated_at = ? WHERE id = ?', [
       status,
@@ -200,6 +226,9 @@ export class PersistenceLayer {
     this.save();
   }
 
+  /**
+   * Retrieves a single session by UUID.
+   */
   getSession(id: string): SessionMetadata | null {
     const stmt = this.db.prepare(`
       SELECT s.*,
@@ -217,6 +246,9 @@ export class PersistenceLayer {
     return null;
   }
 
+  /**
+   * Lists sessions sorted by most recent timestamp.
+   */
   listSessions(options?: {
     status?: string;
     limit?: number;
@@ -253,6 +285,9 @@ export class PersistenceLayer {
     return rows.map((row) => this.rowToSessionMetadata(row));
   }
 
+  /**
+   * Counts total number of sessions stored.
+   */
   countSessions(status?: string): number {
     let sql = 'SELECT COUNT(*) as count FROM sessions';
     const params: SqlValue[] = [];
@@ -276,6 +311,9 @@ export class PersistenceLayer {
   // Thought Operations
   // ===========================================================================
 
+  /**
+   * Inserts a new thought into the specified session.
+   */
   insertThought(sessionId: string, thought: ThoughtData): void {
     const type = this.classifyThoughtType(thought);
     this.db.run(
@@ -303,6 +341,9 @@ export class PersistenceLayer {
     this.updateSessionTimestamp(sessionId);
   }
 
+  /**
+   * Retrieves thoughts for a given session, optionally filtered by branch.
+   */
   getThoughts(sessionId: string, branchId?: string): ThoughtData[] {
     let sql = 'SELECT * FROM thoughts WHERE session_id = ?';
     const params: SqlValue[] = [sessionId];
@@ -330,6 +371,9 @@ export class PersistenceLayer {
   // Branch Operations
   // ===========================================================================
 
+  /**
+   * Inserts a new branch record into the session.
+   */
   insertBranch(sessionId: string, branch: BranchData): void {
     this.db.run(
       `INSERT INTO branches (id, session_id, origin_thought, status, conclusion, agent_id,
@@ -348,6 +392,9 @@ export class PersistenceLayer {
     this.updateSessionTimestamp(sessionId);
   }
 
+  /**
+   * Marks a branch as closed with an optional summary conclusion.
+   */
   updateBranchClose(
     sessionId: string,
     branchId: string,
@@ -362,6 +409,9 @@ export class PersistenceLayer {
     this.updateSessionTimestamp(sessionId);
   }
 
+  /**
+   * Marks a branch as merged using a specified integration strategy.
+   */
   updateBranchMerge(
     sessionId: string,
     branchId: string,
@@ -375,6 +425,9 @@ export class PersistenceLayer {
     this.updateSessionTimestamp(sessionId);
   }
 
+  /**
+   * Retrieves all branches for a given session.
+   */
   getBranches(sessionId: string): BranchData[] {
     const stmt = this.db.prepare(
       'SELECT * FROM branches WHERE session_id = ? ORDER BY created_at ASC'
@@ -394,6 +447,9 @@ export class PersistenceLayer {
   // Tag Operations
   // ===========================================================================
 
+  /**
+   * Replaces tags associated with a specific thought in a session.
+   */
   setTags(sessionId: string, thoughtNumber: number, tags: string[]): void {
     this.db.run(
       'DELETE FROM tags WHERE session_id = ? AND thought_number = ?',
@@ -408,6 +464,9 @@ export class PersistenceLayer {
     this.updateSessionTimestamp(sessionId);
   }
 
+  /**
+   * Internal helper to batch-fetch tags for all thoughts in a session.
+   */
   private getTagsBySession(sessionId: string): Map<number, string[]> {
     const stmt = this.db.prepare(
       'SELECT thought_number, tag FROM tags WHERE session_id = ? ORDER BY thought_number ASC'
@@ -429,9 +488,12 @@ export class PersistenceLayer {
   }
 
   // ===========================================================================
-  // Full Session Load (hydration)
+  // Full Session Hydration
   // ===========================================================================
 
+  /**
+   * Loads complete session metadata, thoughts, and branch structures from database.
+   */
   loadSession(
     id: string
   ): { metadata: SessionMetadata; state: SessionState } | null {
@@ -441,6 +503,7 @@ export class PersistenceLayer {
     const thoughts = this.getThoughts(id);
     const branches = this.getBranches(id);
 
+    // Reconstruct branch objects with their nested thoughts
     const branchRecord: Record<string, BranchData> = {};
     for (const branch of branches) {
       branch.thoughts = thoughts.filter((t) => t.branchId === branch.branchId);
@@ -458,13 +521,16 @@ export class PersistenceLayer {
     };
   }
 
+  /**
+   * Flushes unsaved changes and closes database connection.
+   */
   close(): void {
     this.save();
     this.db.close();
   }
 
   // ===========================================================================
-  // Internal Helpers
+  // Internal Mapping Helpers
   // ===========================================================================
 
   private classifyThoughtType(thought: ThoughtData): string {
@@ -529,7 +595,7 @@ export class PersistenceLayer {
 }
 
 // =============================================================================
-// Row Types
+// Row Types (SQLite result shapes)
 // =============================================================================
 
 interface SessionRow {
@@ -576,8 +642,13 @@ interface TagRow {
 }
 
 // =============================================================================
-// Path Resolution
+// Cross-Platform Path Resolution (Windows & Linux / macOS)
 // =============================================================================
+// Resolves database file locations cleanly across platforms:
+// - Supports ':memory:' for transient in-memory operations.
+// - Expands '~' using process.env.USERPROFILE (Windows) or process.env.HOME (Linux/macOS).
+// - Strips duplicate leading slashes/backslashes.
+// - Defaults to project-local `.maxential/thinking.db` relative to process.cwd().
 
 export function resolveDbPath(): string {
   const envPath = process.env.MAXENTIAL_DB_PATH;
@@ -588,6 +659,7 @@ export function resolveDbPath(): string {
 
   if (envPath) {
     if (envPath.startsWith('~')) {
+      // In Windows, USERPROFILE is the equivalent of Linux $HOME
       const homeDir = process.env.HOME || process.env.USERPROFILE || '';
       const relativePart = envPath.slice(1).replace(/^[/\\]+/, '');
       return path.resolve(path.join(homeDir, relativePart));
@@ -595,5 +667,6 @@ export function resolveDbPath(): string {
     return path.resolve(envPath);
   }
 
+  // Default: project-local .maxential/thinking.db
   return path.resolve(path.join(process.cwd(), '.maxential', 'thinking.db'));
 }
